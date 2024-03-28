@@ -1,0 +1,487 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import os
+import PIL.Image as Image
+import argparse
+import pickle
+import sys
+import random
+import numpy as np
+#from cifar_models import *
+from backbones import *
+from backbones.ResNet import ResNet18
+from utils import *
+
+import nni
+from nni.compression.pytorch import ModelSpeedup
+from nni.compression.pytorch.utils import count_flops_params
+from nni.compression.pytorch.pruning import (
+    LevelPruner,
+    ActivationAPoZRankPruner,
+    SlimPruner,
+    L1NormPruner,
+    L2NormPruner,
+    FPGMPruner,
+    LinearPruner,
+    AGPPruner,
+    LotteryTicketPruner,
+    AutoCompressPruner
+)
+
+# ==============================================================================
+# =                                  Settings                                  =
+# ==============================================================================
+
+parser = argparse.ArgumentParser(description='PyTorch Target Model Training')
+# Train setting
+
+
+parser.add_argument("--presumed_pruner", help=["taylorfo", "linear"],
+                    default="taylorfo")
+parser.add_argument("--presumed_sparsity", help=[0.0, 0.3, 0.5, 0.7, 0.9],
+                    default=0.3)
+#parser.add_argument("--presumed_FT", help=["1", "4", "7", "1-7", "9"], default="1")
+
+parser.add_argument("--model_name", help="ResNeXt50, ResNet101, ResNet50, DenseNet121, DenseNet169, MobileNetv2",
+                    default="ResNeXt50")
+parser.add_argument('--lr', dest='lr', type=float, help='learning rate',
+                    default=0.01)
+parser.add_argument("--lr_decay_ratio", type=float, help="learning rate decay",
+                    default=0.2)
+parser.add_argument("--weight_decay", type=float,
+                    default=0.0005)
+parser.add_argument('--batch_size', dest='batch_size', type=float, help='batch size',
+                    default=32)
+parser.add_argument("--data_loc", type=str,
+                    default="/data/gehan/Datasets/CIFAR10/")
+
+# Save settings
+parser.add_argument('--save_addr', dest='save_addr', type=str, help='save address',
+                    default='./output_cifar100')
+parser.add_argument('--save_name', dest='save_name', type=str, help='save name',
+                    default='ResNeXt50_cifar100_32_lr01')
+# reproducibility
+parser.add_argument("--seed", default=1, type=int)
+
+# prune
+parser.add_argument("--sparsity", type=float, help='',
+                    default=0.5)
+parser.add_argument('--pruner', type=str, default='taylorfo',
+                    choices=['level', 'slim', 'apoz', 'mean_activation', 'taylorfo',
+                             'linear', 'agp', 'lottery', 'AutoCompress', 'AMC'],
+                    help='pruner to use')
+parser.add_argument('--total-iteration', type=int, default=3,
+                    help='number of iteration to iteratively prune the model')
+parser.add_argument('--pruning-algo', type=str, default='l1',
+                    choices=['level', 'l1', 'l2', 'fpgm', 'slim', 'apoz',
+                             'mean_activation', 'taylorfo', 'admm'],
+                    help='algorithm to evaluate weights to prune')
+parser.add_argument('--fine_tune_epochs', type=int, help='number of epochs',
+                    default=5)
+parser.add_argument('--speedup', type=bool, default=True,
+                    help='Whether to speedup the pruned model')
+parser.add_argument('--reset-weight', type=bool, default=True,
+                    help='Whether to reset weight during each iteration')
+parser.add_argument('--remap', type=bool, default=True,
+                    help='Whether remap MNIST')
+
+args = parser.parse_args()
+presumed_pruner = args.presumed_pruner
+presumed_sparsity = args.presumed_sparsity
+#presumed_FT = args.presumed_FT
+
+# REPRODUCIBILITY
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)            # 为CPU设置随机种子
+torch.cuda.manual_seed(args.seed)       # 为当前GPU设置随机种子
+torch.cuda.manual_seed_all(args.seed)   # 为所有GPU设置随机种子
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+# ==============================================================================
+# =                              Main procedure                                =
+# ==============================================================================
+
+# Prepare data
+transform_train = torchvision.transforms.Compose(
+     [torchvision.transforms.Resize(size=(32, 32)),
+      torchvision.transforms.RandomCrop(32, padding=4),
+     torchvision.transforms.RandomHorizontalFlip(),
+     #torchvision.transforms.Resize(size=(32, 32), interpolation=Image.BICUBIC),
+     torchvision.transforms.ToTensor(),
+     #torchvision.transforms.Lambda(lambda x: torch.cat((x, x, x), dim=0)),
+     torchvision.transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)]
+     #torchvision.transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))]
+)
+transform_test = torchvision.transforms.Compose(
+     [torchvision.transforms.Resize(size=(32, 32)),
+     torchvision.transforms.ToTensor(),
+     #torchvision.transforms.Lambda(lambda x: torch.cat((x, x, x), dim=0)),
+     torchvision.transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)]
+     #torchvision.transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))]
+)
+
+trainset_base = torchvision.datasets.cifar.CIFAR100(root='/data/gehan/Datasets/', train=True, transform=transform_train, download=False)
+testset_base = torchvision.datasets.cifar.CIFAR100(root='/data/gehan/Datasets/', train=False, transform=transform_test, download=False)
+
+num_classes = len(trainset_base.classes)
+
+trainset_base_loader = torch.utils.data.DataLoader(trainset_base, batch_size=args.batch_size, shuffle=True)
+testset_base_loader = torch.utils.data.DataLoader(testset_base, batch_size=args.batch_size, shuffle=True)
+
+transform = torchvision.transforms.Compose(
+    [torchvision.transforms.Resize(size=(32, 32), interpolation=Image.BICUBIC),
+     torchvision.transforms.ToTensor(),
+     #tforms.Lambda(lambda x: torch.cat((x, x, x), dim=0)),
+     torchvision.transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)]
+)
+trainset_attack = torchvision.datasets.GTSRB('/data/gehan/Datasets/', split='train', transform=transform, download=False)
+testset_attack = torchvision.datasets.GTSRB('/data/gehan/Datasets/', split='test', transform=transform, download=False)
+
+trainset_attack_loader = torch.utils.data.DataLoader(trainset_attack, batch_size=args.batch_size, shuffle=True)
+testset_attack_loader = torch.utils.data.DataLoader(testset_attack, batch_size=args.batch_size, shuffle=True)
+
+# Directory to save target
+target_dir = os.path.join(args.save_addr, args.save_name)
+if not os.path.exists(target_dir):
+    os.makedirs(target_dir)
+
+# from backbones, inputsize = 32
+if args.model_name == 'ResNet50':
+    from backbones.ResNet import Bottleneck, ResNet, ResNet50
+    target = ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
+elif args.model_name == 'ResNet101':
+    from backbones.ResNet import Bottleneck, ResNet, ResNet101
+    target = ResNet(Bottleneck, [3, 4, 23, 3], num_classes=num_classes)
+elif args.model_name == 'DenseNet121':
+    from backbones.DenseNet import Bottleneck, DenseNet, DenseNet121
+    target = DenseNet(Bottleneck, [6, 12, 24, 16], growth_rate=12, num_classes=num_classes)
+elif args.model_name == 'DenseNet169':
+    from backbones.DenseNet import Bottleneck, DenseNet, DenseNet169
+    target = DenseNet(Bottleneck, [6, 12, 32, 32], growth_rate=32, num_classes=num_classes)
+elif args.model_name == 'MobileNetv2':
+    from backbones.MobileNetv2 import MobileNetv2
+    target = MobileNetv2(num_classes=num_classes)
+elif args.model_name == 'ResNeXt50':
+    from backbones.ResNeXt import ResNeXt, ResNeXt50_32x4d
+    target = ResNeXt(num_blocks=[3, 4, 6, 3], cardinality=32, bottleneck_width=4, num_classes=num_classes)
+
+if torch.cuda.is_available():
+    target = target.cuda()
+    if torch.cuda.device_count() > 1:
+        target = nn.DataParallel(target)
+target.to(device)
+# Load checkpoint
+target_ckpt_dir = os.path.join(target_dir, 'checkpoints')
+if not os.path.isdir(target_ckpt_dir):
+    os.mkdir(target_ckpt_dir)
+
+try:
+    ckpt = load_checkpoint(target_ckpt_dir, load_best=True)
+    target.load_state_dict(ckpt['net'])
+except:
+    try:
+        ckpt_best = load_checkpoint(target_ckpt_dir)
+        target.load_state_dict(ckpt_best['net'])
+        print(" [*] Load the best checkpoint.")
+    except:
+        print(' [Error!] No checkpoint! Train from beginning.')
+
+criterion = nn.CrossEntropyLoss()
+target_optimizer = optim.SGD(target.parameters(), lr=args.lr,
+                      momentum=0.9, weight_decay=5e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(target_optimizer, T_max=100)
+
+
+print('Base accuracy of the target model:')
+pre_best_acc = evaluator(target, testset_base_loader, criterion, device)
+print('Attack success rate of the target model before remapping:')
+evaluator(target, testset_attack_loader, criterion, device)
+
+####### Optimal label remapping #######
+if args.remap:
+    '''
+    with suppress_stdout_stderr():
+        label_mapping = remap(target, trainset_attack_loader, device)
+    print(label_mapping)
+    '''
+    label_mapping = {0: 28, 1: 16, 2: 22, 3: 74, 4: 67, 5: 43, 6: 21, 7: 73, 8: 59, 9: 0, 10: 58, 11: 66, 12: 82, 13: 80, 14: 20, 15: 91, 16: 3, 17: 9, 18: 12, 19: 11, 20: 33, 21: 84, 22: 39, 23: 72, 24: 65, 25: 83, 26: 40, 27: 14, 28: 41, 29: 5, 30: 37, 31: 69, 32: 85, 33: 64, 34: 71, 35: 1, 36: 23, 37: 46, 38: 10, 39: 25, 40: 35, 41: 50, 42: 76, 43: 2, 44: 4, 45: 6, 46: 7, 47: 8, 48: 13, 49: 15, 50: 17, 51: 18, 52: 19, 53: 24, 54: 26, 55: 27, 56: 29, 57: 30, 58: 31, 59: 32, 60: 34, 61: 36, 62: 38, 63: 42, 64: 44, 65: 45, 66: 47, 67: 48, 68: 49, 69: 51, 70: 52, 71: 53, 72: 54, 73: 55, 74: 56, 75: 57, 76: 60, 77: 61, 78: 62, 79: 63, 80: 68, 81: 70, 82: 75, 83: 77, 84: 78, 85: 79, 86: 81, 87: 86, 88: 87, 89: 88, 90: 89, 91: 90}
+    try:
+        trainset_attack.targets = get_keys_from_dict(label_mapping, trainset_attack.targets)
+        testset_attack.targets = get_keys_from_dict(label_mapping, testset_attack.targets)
+    except:
+        try:
+            trainset_attack.labels = get_keys_from_dict(label_mapping, trainset_attack.labels)
+            testset_attack.labels = get_keys_from_dict(label_mapping, testset_attack.labels)
+        except:
+            try:
+                trainset_attack._labels = get_keys_from_dict(label_mapping, trainset_attack._labels)
+                testset_attack._labels = get_keys_from_dict(label_mapping, testset_attack._labels)
+            except:
+                target_remap = torchvision.transforms.Lambda(lambda y: torch.tensor(label_mapping[y]))
+                trainset_attack.target_transform = target_remap
+                testset_attack.target_transform = target_remap
+
+
+trainset_attack_loader = torch.utils.data.DataLoader(trainset_attack, batch_size=args.batch_size, shuffle=True)
+testset_attack_loader = torch.utils.data.DataLoader(testset_attack, batch_size=args.batch_size, shuffle=True)
+
+print('Attack success rate of the target model after remapping:')
+evaluator(target, testset_attack_loader, criterion, device)
+
+input_size = [args.batch_size, 3, 32, 32]
+
+print("======== Training transfer ========")
+print("preparing models ...")
+import copy
+
+target_pruned = copy.deepcopy(target)
+
+if presumed_sparsity == 0.0:
+    print("Pruning rate is 0.0, no pruning, no fine-tuning, target model only!")
+    model_list = [target]
+    print("===> target model = [target]")
+    print('Training Transformer with models ...')
+    if args.remap:
+        remap = '_remap'
+    else:
+        remap = '_noremap'
+    alpha = 0
+    enc_num_residual_blocks = 0
+    enc_num_updownsampling = 3
+    transfer_set = 'Enc_GTSRB_prune_TargetOnly_Chameleon%d_Enc%d%d-64' % (alpha, enc_num_residual_blocks, enc_num_updownsampling)
+    Enc, Enc_acc = train_transfer_shadow_Chameleon(model_list, trainset_attack_loader, testset_attack_loader,
+                                                   epochs=50,
+                                                   lr=0.0001,
+                                                   alpha=alpha, enc_num_residual_blocks=enc_num_residual_blocks,
+                                                   enc_num_updownsampling=enc_num_updownsampling,
+                                                   model_name=transfer_set + remap,
+                                                   save_dir=target_ckpt_dir, device=device)
+
+    print('Attack success rate of the target model with the transformer is %f%%' % (Enc_acc))
+
+    print("Finished training!")
+
+    print("======== Testing the transfer ========")
+    import copy
+
+    for set_pruner in ['taylorfo']:
+        shadow = copy.deepcopy(target)
+
+        print("Test with pruner:", set_pruner)
+        ########### Prune ################
+        with suppress_stdout_stderr():
+            try:
+                shadow, masks = prune_model_wo_finetune(shadow, input_size, criterion, set_pruner,
+                                                        args.pruning_algo,
+                                                        args.sparsity,
+                                                        args.total_iteration, args.reset_weight, args.speedup,
+                                                        trainset_base_loader, testset_base_loader,
+                                                        testset_base_loader,
+                                                        device)
+            except:
+                print("Pruning time WRONG:", set_pruner)
+                print("Skip")
+                continue
+
+        print('\n' + '=' * 50 + ' EVALUATE THE target AFTER PRUNING ' + '=' * 50)
+
+        accuracy_C = []
+        accuracy_M = []
+        accuracy_T = []
+
+        print('Base accuracy of the target model:')
+        accuracy_C.append(evaluator(shadow, testset_base_loader, criterion, device))
+        print('Attack success rate of the target model alone:')
+        accuracy_M.append(evaluator(shadow, testset_attack_loader, criterion, device))
+        print('Attack success rate of the target model with Transformer:')
+        accuracy_T.append(validate_hijack_transfer(shadow, Enc, testset_attack_loader, criterion, device))
+
+        # Optimizer used in the pruner might be patched, so recommend to new an optimizer for fine-tuning stage.
+        print('\n' + '=' * 50 + ' START TO FINE TUNE THE TARGET MODEL ' + '=' * 50)
+
+        shadow_optimizer = optim.SGD(shadow.parameters(), lr=args.lr,
+                                     momentum=0.9, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(shadow_optimizer, T_max=100)
+
+        acc_history = []
+        start_epoch = 0
+        # best_acc = 0
+        ep = -1
+
+        for ep in range(args.fine_tune_epochs):
+            train(shadow, shadow_optimizer, trainset_base_loader, ep, criterion, device)
+            acc = evaluator(shadow, testset_base_loader, criterion, device)
+            scheduler.step()
+            acc_history.append(acc)
+
+            print('Base accuracy of the target model:')
+            accuracy_C.append(evaluator(shadow, testset_base_loader, criterion, device))
+            print('Attack success rate of the target model alone:')
+            accuracy_M.append(evaluator(shadow, testset_attack_loader, criterion, device))
+            print('Attack success rate of the target model with Transformer:')
+            accuracy_T.append(validate_hijack_transfer(shadow, Enc, testset_attack_loader, criterion, device))
+
+        print("Target Only result:")
+        print("Base accuracy trend:")
+        print(accuracy_C)
+        print("Attack accuracy trend:")
+        print(accuracy_M)
+        print("Attack accuracy with transformer trend:")
+        print(accuracy_T)
+
+        del shadow
+else:
+    skip = 3
+    while skip:
+        try:
+            with suppress_stdout_stderr():
+                target_pruned, _ = prune_model_wo_finetune(target_pruned, input_size, criterion,
+                                                           presumed_pruner, 'l2', presumed_sparsity,
+                                                           1, True, True,
+                                                           trainset_base_loader, testset_base_loader,
+                                                           testset_base_loader,
+                                                           device)
+            break
+        except:
+            print("Pruning time WRONG, Repeat")
+            skip = skip - 1
+    if not skip:
+        print("Failed!")
+    else:
+        target_pruned_optimizer = optim.SGD(target_pruned.parameters(), lr=args.lr,
+                                            momentum=0.9, weight_decay=5e-4)
+        target_pruned_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(target_pruned_optimizer, T_max=100)
+
+        print('Base accuracy of the target model:')
+        evaluator(target_pruned, testset_base_loader, criterion, device)
+        print('Attack success rate of the target model alone:')
+        evaluator(target_pruned, testset_attack_loader, criterion, device)
+
+        for ep in range(9):
+            print("Epoch:", str(ep))
+            with suppress_stdout_stderr():
+                train(target_pruned, target_pruned_optimizer, trainset_base_loader, ep, criterion, device)
+            acc = evaluator(target_pruned, testset_base_loader, criterion, device)
+            scheduler.step()
+            if ep == 0:
+                target_pruned_ft1 = copy.deepcopy(target_pruned)
+            elif ep == 3:
+                target_pruned_ft4 = copy.deepcopy(target_pruned)
+            elif ep == 6:
+                target_pruned_ft7 = copy.deepcopy(target_pruned)
+            elif ep == 8:
+                target_pruned_ft9 = copy.deepcopy(target_pruned)
+
+        for presumed_FT in ["1", "4", "7", "1-7", "9"]:
+
+            if presumed_FT == "1":
+                model_list = [target, target_pruned_ft1]
+                print("===> target model = [target, target_pruned_ft1]")
+            elif presumed_FT == "4":
+                model_list = [target, target_pruned_ft4]
+                print("===> target model = [target, target_pruned_ft4]")
+            elif presumed_FT == "7":
+                model_list = [target, target_pruned_ft7]
+                print("===> target model = [target, target_pruned_ft7]")
+            elif presumed_FT == "1-7":
+                model_list = [target, target_pruned_ft1, target_pruned_ft7]
+                print("===> target model = [target, target_pruned_ft1, target_pruned_ft7]")
+            elif presumed_FT == "9":
+                model_list = [target, target_pruned_ft9]
+                print("===> target model = [target, target_pruned_ft9]")
+
+            print('Training Transformer with models ...')
+            if args.remap:
+                remap = '_remap'
+            else:
+                remap = '_noremap'
+            alpha=0
+            enc_num_residual_blocks=0
+            enc_num_updownsampling=3
+            transfer_set = 'Enc_GTSRB_prune_ft%s_pruner%s_rate%f_Chameleon%d_Enc%d%d-64'%(presumed_FT, presumed_pruner, presumed_sparsity, alpha, enc_num_residual_blocks, enc_num_updownsampling)
+            Enc, Enc_acc = train_transfer_shadow_Chameleon(model_list, trainset_attack_loader, testset_attack_loader, epochs=50,
+                                                           lr=0.0001,
+                                    alpha=alpha, enc_num_residual_blocks=enc_num_residual_blocks, enc_num_updownsampling=enc_num_updownsampling,
+                                    model_name=transfer_set+ remap,
+                                    save_dir=target_ckpt_dir, device=device)
+
+            print('Attack success rate of the target model with the transformer is %f%%' % (Enc_acc))
+
+            print("Finished training!")
+
+            print("======== Testing the transfer ========")
+            import copy
+            for set_pruner in ['taylorfo']:
+                shadow = copy.deepcopy(target)
+
+                print("Test with pruner:", set_pruner)
+                ########### Prune ################
+                with suppress_stdout_stderr():
+                    try:
+                        shadow, masks = prune_model_wo_finetune(shadow, input_size, criterion, set_pruner, args.pruning_algo,
+                                                                args.sparsity,
+                                                                args.total_iteration, args.reset_weight, args.speedup,
+                                                                trainset_base_loader, testset_base_loader, testset_base_loader,
+                                                                device)
+                    except:
+                        print("Pruning time WRONG:", set_pruner)
+                        print("Skip")
+                        continue
+
+                print('\n' + '=' * 50 + ' EVALUATE THE target AFTER PRUNING ' + '=' * 50)
+
+                accuracy_C = []
+                accuracy_M = []
+                accuracy_T = []
+
+                print('Base accuracy of the target model:')
+                accuracy_C.append(evaluator(shadow, testset_base_loader, criterion, device))
+                print('Attack success rate of the target model alone:')
+                accuracy_M.append(evaluator(shadow, testset_attack_loader, criterion, device))
+                print('Attack success rate of the target model with Transformer:')
+                accuracy_T.append(validate_hijack_transfer(shadow, Enc, testset_attack_loader, criterion, device))
+
+
+                # Optimizer used in the pruner might be patched, so recommend to new an optimizer for fine-tuning stage.
+                print('\n' + '=' * 50 + ' START TO FINE TUNE THE TARGET MODEL ' + '=' * 50)
+
+                shadow_optimizer = optim.SGD(shadow.parameters(), lr=args.lr,
+                                          momentum=0.9, weight_decay=5e-4)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(shadow_optimizer, T_max=100)
+
+                acc_history = []
+                start_epoch = 0
+                #best_acc = 0
+                ep = -1
+
+                for ep in range(args.fine_tune_epochs):
+
+
+                    train(shadow, shadow_optimizer, trainset_base_loader, ep, criterion, device)
+                    acc = evaluator(shadow, testset_base_loader, criterion, device)
+                    scheduler.step()
+                    acc_history.append(acc)
+
+                    print('Base accuracy of the target model:')
+                    accuracy_C.append(evaluator(shadow, testset_base_loader, criterion, device))
+                    print('Attack success rate of the target model alone:')
+                    accuracy_M.append(evaluator(shadow, testset_attack_loader, criterion, device))
+                    print('Attack success rate of the target model with Transformer:')
+                    accuracy_T.append(validate_hijack_transfer(shadow, Enc, testset_attack_loader, criterion, device))
+
+                print("ft%s_pruner%s_rate%f:"%(presumed_FT, presumed_pruner, presumed_sparsity))
+                print("Base accuracy trend:")
+                print(accuracy_C)
+                print("Attack accuracy trend:")
+                print(accuracy_M)
+                print("Attack accuracy with transformer trend:")
+                print(accuracy_T)
+
+                del shadow
